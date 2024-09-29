@@ -1,6 +1,6 @@
 use std::{
     collections::VecDeque,
-    num::{NonZeroU16, Wrapping},
+    num::{NonZeroU16, NonZeroU32, Wrapping},
     time::Duration,
 };
 
@@ -61,7 +61,7 @@ impl<'a> Client<'a> {
             framed_read: FramedRead::new(
                 read_half,
                 MqttDecoder {
-                    max_packet_length: 1000,
+                    max_packet_length: connection_settings.maximum_packet_size(),
                     decoder_state: DecoderState::default(),
                 },
             ),
@@ -145,7 +145,9 @@ impl<'a> Client<'a> {
                 .map(SessionExpiryInterval::new)
                 .unwrap_or_default(),
             receive_maximum: ReceiveMaximum::default(),
-            maximum_packet_size: MaximumPacketSize::default(),
+            maximum_packet_size: MaximumPacketSize::new(
+                self.connection_settings.maximum_packet_size,
+            ),
             topic_alias_maximum: TopicAliasMaximum::default(),
             request_response_information: RequestResponseInformation::default(),
             request_problem_information: RequestProblemInformation::default(),
@@ -182,6 +184,11 @@ impl<'a> Client<'a> {
         if let Some(keep_alive) = conn_ack.server_keep_aliave.get() {
             self.keep_alive = keep_alive;
         }
+
+        self.framed_write.encoder_mut().max_packet_length = conn_ack
+            .maximum_packet_size
+            .get()
+            .map_or(u32::MAX, NonZeroU32::get);
 
         Ok(())
     }
@@ -337,6 +344,15 @@ pub struct ConnectionSettings {
     pub session_expiry_interval: Option<u32>,
     pub user_name: Option<String>,
     pub password: Option<Bytes>,
+    pub maximum_packet_size: Option<NonZeroU32>,
+}
+
+impl ConnectionSettings {
+    fn maximum_packet_size(&self) -> usize {
+        self.maximum_packet_size
+            .and_then(|size| usize::try_from(size.get()).ok())
+            .unwrap_or(usize::MAX)
+    }
 }
 
 impl Default for ConnectionSettings {
@@ -348,6 +364,7 @@ impl Default for ConnectionSettings {
             session_expiry_interval: None,
             user_name: None,
             password: None,
+            maximum_packet_size: NonZeroU32::new(0x10000),
         }
     }
 }

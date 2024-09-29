@@ -1001,6 +1001,10 @@ pub struct MaximumPacketSize {
 }
 
 impl MaximumPacketSize {
+    pub fn new(value: Option<NonZeroU32>) -> Self {
+        Self { value }
+    }
+
     pub fn get(&self) -> Option<NonZeroU32> {
         self.value
     }

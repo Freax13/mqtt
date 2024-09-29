@@ -1,6 +1,6 @@
 use std::{
     cmp,
-    collections::VecDeque,
+    collections::{HashMap, VecDeque},
     num::{NonZeroU16, NonZeroU32, Wrapping},
     time::Duration,
 };
@@ -221,10 +221,6 @@ impl<'a> Client<'a> {
             return Err(Error::ConnectFailed(conn_ack.connect_reason_code));
         }
 
-        if !conn_ack.session_present {
-            self.session_state.reset();
-        }
-
         if let Some(assigned_client_identifier) = conn_ack.assigned_client_identifier.get() {
             self.session_state.client_identifier = Some(assigned_client_identifier.to_owned());
         }
@@ -238,6 +234,13 @@ impl<'a> Client<'a> {
             .maximum_packet_size
             .get()
             .map_or(u32::MAX, NonZeroU32::get);
+
+        if !conn_ack.session_present {
+            // Re-subscribe to topics.
+            for (topic, subscription) in self.session_state.subscriptions.clone().iter() {
+                self.subscribe(topic, subscription.retain_handling).await?;
+            }
+        }
 
         self.reconnect_state.set_connected();
 
@@ -292,13 +295,17 @@ impl<'a> Client<'a> {
     }
 
     /// This method is not cancellation safe.
-    pub async fn subscribe(&mut self, topic_name: &str) -> Result<()> {
+    pub async fn subscribe(
+        &mut self,
+        topic_name: &str,
+        retain_handling: RetainHandling,
+    ) -> Result<()> {
         let packet_identifier = self.session_state.id_allocator.allocate()?;
         let packet = ControlPacket::Subscribe(Subscribe {
             packet_identifier,
             subscription_identifier: SubscriptionIdentifierSingle::default(),
             user_property: UserProperty::default(),
-            topic_filters: vec![(topic_name.to_owned(), 2 << 4)],
+            topic_filters: vec![(topic_name.to_owned(), (retain_handling as u8) << 4)],
         });
 
         'outer: for _ in 0..=self.connection_settings.max_retries {
@@ -344,6 +351,10 @@ impl<'a> Client<'a> {
             if !sub_ack_reason_code.is_success() {
                 return Err(Error::SubscriptionFailed(sub_ack_reason_code));
             }
+
+            self.session_state
+                .subscriptions
+                .insert(topic_name.to_owned(), Subscription { retain_handling });
 
             return Ok(());
         }
@@ -540,6 +551,7 @@ impl ReconnectState {
 pub struct ClientSessionState {
     client_identifier: Option<String>,
     id_allocator: IdAllocator,
+    subscriptions: HashMap<String, Subscription>,
 }
 
 impl ClientSessionState {
@@ -547,10 +559,9 @@ impl ClientSessionState {
         Self {
             client_identifier: None,
             id_allocator: IdAllocator::new(),
+            subscriptions: HashMap::new(),
         }
     }
-
-    fn reset(&mut self) {}
 }
 
 impl Default for ClientSessionState {
@@ -599,6 +610,21 @@ impl Default for IdAllocator {
         this.bits.set_bit(0, true);
         this
     }
+}
+
+#[derive(Clone, Copy)]
+struct Subscription {
+    retain_handling: RetainHandling,
+}
+
+#[derive(Clone, Copy)]
+pub enum RetainHandling {
+    /// Always send retained messages.
+    Always,
+    /// Send retained messages if the subscription does not already exist.
+    IfNotExist,
+    /// Never send retained messages.
+    Never,
 }
 
 struct MqttDecoder {

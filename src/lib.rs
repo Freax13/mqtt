@@ -1,4 +1,5 @@
 use std::{
+    cmp,
     collections::VecDeque,
     num::{NonZeroU16, NonZeroU32, Wrapping},
     time::Duration,
@@ -92,14 +93,15 @@ impl<'a> Client<'a> {
         // might as let connection die.
 
         loop {
+            let mut timeout = self.connection_settings.timeout;
             let keep_alive_elapsed = if let Some(keep_alive) = self.keep_alive {
                 let duration = Duration::from_secs(u64::from(keep_alive.get()));
+                timeout = cmp::max(timeout, duration * 2);
                 Some(sleep_until(self.last_sent + duration))
             } else {
                 None
             };
-            let receive_timeout =
-                sleep_until(self.last_received + self.connection_settings.timeout);
+            let receive_timeout = sleep_until(self.last_received + timeout);
 
             select! {
                 biased;
@@ -181,9 +183,10 @@ impl<'a> Client<'a> {
             self.session_state.client_identifier = Some(assigned_client_identifier.to_owned());
         }
 
-        if let Some(keep_alive) = conn_ack.server_keep_aliave.get() {
-            self.keep_alive = keep_alive;
-        }
+        self.keep_alive = conn_ack
+            .server_keep_aliave
+            .get()
+            .unwrap_or(self.connection_settings.keep_alive);
 
         self.framed_write.encoder_mut().max_packet_length = conn_ack
             .maximum_packet_size

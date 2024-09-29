@@ -21,7 +21,7 @@ use tokio::{
     io::AsyncWriteExt,
     net::{
         tcp::{OwnedReadHalf, OwnedWriteHalf},
-        TcpStream, ToSocketAddrs,
+        TcpStream,
     },
     select,
     time::{sleep_until, timeout, Instant},
@@ -38,48 +38,94 @@ pub mod packet;
 pub mod property;
 
 pub struct Client<'a> {
+    addr: (&'a str, u16),
     connection_settings: ConnectionSettings,
     session_state: &'a mut ClientSessionState,
-    framed_read: FramedRead<OwnedReadHalf, MqttDecoder>,
-    framed_write: FramedWrite<OwnedWriteHalf, MqttEncoder>,
-
-    keep_alive: Option<NonZeroU16>,
-    last_sent: Instant,
-    last_received: Instant,
-    buffered_publish_messages: VecDeque<Publish>,
+    connection: Connection,
+    reconnect_state: ReconnectState,
 }
 
 impl<'a> Client<'a> {
     pub async fn new(
-        addr: impl ToSocketAddrs,
+        addr: (&'a str, u16),
         connection_settings: ConnectionSettings,
-        session_state: &'a mut ClientSessionState,
+        mut session_state: &'a mut ClientSessionState,
     ) -> Result<Client<'a>> {
-        let socket = timeout(connection_settings.timeout, TcpStream::connect(addr)).await??;
-        let (read_half, write_half) = socket.into_split();
-        let mut client = Self {
-            session_state,
-            framed_read: FramedRead::new(
-                read_half,
-                MqttDecoder {
-                    max_packet_length: connection_settings.maximum_packet_size(),
-                    decoder_state: DecoderState::default(),
-                },
-            ),
-            framed_write: FramedWrite::new(
-                write_half,
-                MqttEncoder {
-                    max_packet_length: 1000,
-                },
-            ),
-            keep_alive: connection_settings.keep_alive,
-            last_sent: Instant::now(),
-            last_received: Instant::now(),
-            buffered_publish_messages: VecDeque::new(),
-            connection_settings,
-        };
-        client.connect().await?;
-        Ok(client)
+        let mut reconnect_state = ReconnectState::new(&connection_settings);
+
+        loop {
+            let res = Connection::new(addr, &connection_settings).await;
+            let connection = match res {
+                Ok(connection) => connection,
+                Err(err) => {
+                    error!(%err, "failed to connect");
+                    reconnect_state
+                        .start_reconnect(&connection_settings)
+                        .await?;
+                    continue;
+                }
+            };
+
+            let mut client = Self {
+                addr,
+                connection_settings: connection_settings.clone(),
+                session_state,
+                connection,
+                reconnect_state,
+            };
+            let res = client.connect().await;
+            match res {
+                Ok(()) => break Ok(client),
+                Err(err) => {
+                    error!(%err, "failed to connect");
+
+                    session_state = client.session_state;
+                    reconnect_state = client.reconnect_state;
+
+                    reconnect_state
+                        .start_reconnect(&connection_settings)
+                        .await?;
+
+                    continue;
+                }
+            }
+        }
+    }
+
+    async fn reconnect(&mut self, err: impl Into<Error>) -> Result<()> {
+        let err: Error = err.into();
+        let err = self.reconnect_state.request_reconnect(err)?;
+        error!(%err, "encountered error. reconnecting...");
+
+        loop {
+            self.reconnect_state
+                .start_reconnect(&self.connection_settings)
+                .await?;
+
+            let res = Connection::new(self.addr, &self.connection_settings).await;
+            match res {
+                Ok(connection) => self.connection = connection,
+                Err(err) => {
+                    error!(%err, "failed to connect");
+                    self.reconnect_state
+                        .start_reconnect(&self.connection_settings)
+                        .await?;
+                    continue;
+                }
+            };
+
+            let res = Box::pin(self.connect()).await;
+            match res {
+                Ok(()) => break Ok(()),
+                Err(err) => {
+                    error!(%err, "failed to connect");
+                    self.reconnect_state
+                        .start_reconnect(&self.connection_settings)
+                        .await?;
+                    continue;
+                }
+            }
+        }
     }
 
     /// This method is cancellation safe.
@@ -94,20 +140,20 @@ impl<'a> Client<'a> {
 
         loop {
             let mut timeout = self.connection_settings.timeout;
-            let keep_alive_elapsed = if let Some(keep_alive) = self.keep_alive {
+            let keep_alive_elapsed = if let Some(keep_alive) = self.connection.keep_alive {
                 let duration = Duration::from_secs(u64::from(keep_alive.get()));
                 timeout = cmp::max(timeout, duration * 2);
-                Some(sleep_until(self.last_sent + duration))
+                Some(sleep_until(self.connection.last_sent + duration))
             } else {
                 None
             };
-            let receive_timeout = sleep_until(self.last_received + timeout);
+            let receive_timeout = sleep_until(self.connection.last_received + timeout);
 
             select! {
                 biased;
-                res = self.framed_read.next() => {
+                res = self.connection.framed_read.next() => {
                     let raw = res.ok_or(DecodeError::UnexpectedEof)??;
-                    self.last_received = Instant::now();
+                    self.connection.last_received = Instant::now();
                     let packet = ControlPacket::decode(raw)?;
                     return Ok(packet);
                 }
@@ -118,20 +164,20 @@ impl<'a> Client<'a> {
                     // this get's cancelled, we'll either let the connection
                     // die or send one too many ping requests both of which are
                     // fine.
-                    self.send(ControlPacket::PingReq(PingReq {})).await?;
+                    self.send(&ControlPacket::PingReq(PingReq {})).await?;
                 }
             }
         }
     }
 
-    async fn send(&mut self, packet: ControlPacket) -> Result<()> {
+    async fn send(&mut self, packet: &ControlPacket) -> Result<()> {
         let raw = packet.encode()?;
         timeout(
             self.connection_settings.timeout,
-            self.framed_write.send(raw),
+            self.connection.framed_write.send(raw),
         )
         .await??;
-        self.last_sent = Instant::now();
+        self.connection.last_sent = Instant::now();
         Ok(())
     }
 
@@ -161,13 +207,13 @@ impl<'a> Client<'a> {
             user_name: self.connection_settings.user_name.clone(),
             password: self.connection_settings.password.clone(),
         };
-        self.send(ControlPacket::Connect(connect)).await?;
+        self.send(&ControlPacket::Connect(connect)).await?;
 
         let packet = self.recv().await?;
         let conn_ack = if let ControlPacket::ConnAck(conn_ack) = packet {
             conn_ack
         } else {
-            self.framed_write.get_mut().shutdown().await?;
+            self.connection.framed_write.get_mut().shutdown().await?;
             return Err(Error::UnexpectedPacket);
         };
 
@@ -183,15 +229,17 @@ impl<'a> Client<'a> {
             self.session_state.client_identifier = Some(assigned_client_identifier.to_owned());
         }
 
-        self.keep_alive = conn_ack
+        self.connection.keep_alive = conn_ack
             .server_keep_aliave
             .get()
             .unwrap_or(self.connection_settings.keep_alive);
 
-        self.framed_write.encoder_mut().max_packet_length = conn_ack
+        self.connection.framed_write.encoder_mut().max_packet_length = conn_ack
             .maximum_packet_size
             .get()
             .map_or(u32::MAX, NonZeroU32::get);
+
+        self.reconnect_state.set_connected();
 
         Ok(())
     }
@@ -209,8 +257,7 @@ impl<'a> Client<'a> {
                 Some(self.session_state.id_allocator.allocate()?)
             }
         };
-
-        let publish = Publish {
+        let packet = ControlPacket::Publish(Publish {
             retain: false,
             qos_level,
             dup_flag: false,
@@ -225,79 +272,106 @@ impl<'a> Client<'a> {
             subscription_identifier: SubscriptionIdentifierMultiple::default(),
             content_type: ContentType::default(),
             data,
-        };
-        self.send(ControlPacket::Publish(publish)).await?;
+        });
 
-        match qos_level {
-            QoSLevel::AtMostOnce => {}
-            QoSLevel::AtLeastOnce => todo!(),
-            QoSLevel::ExactlyOnce => todo!(),
+        for _ in 0..=self.connection_settings.max_retries {
+            if let Err(err) = self.send(&packet).await {
+                self.reconnect(err).await?;
+                continue;
+            }
+
+            match qos_level {
+                QoSLevel::AtMostOnce => {}
+                QoSLevel::AtLeastOnce => todo!(),
+                QoSLevel::ExactlyOnce => todo!(),
+            }
+
+            return Ok(());
         }
-
-        Ok(())
+        Err(Error::TooManyRetries)
     }
 
     /// This method is not cancellation safe.
     pub async fn subscribe(&mut self, topic_name: &str) -> Result<()> {
         let packet_identifier = self.session_state.id_allocator.allocate()?;
-
-        self.send(ControlPacket::Subscribe(Subscribe {
+        let packet = ControlPacket::Subscribe(Subscribe {
             packet_identifier,
             subscription_identifier: SubscriptionIdentifierSingle::default(),
             user_property: UserProperty::default(),
             topic_filters: vec![(topic_name.to_owned(), 2 << 4)],
-        }))
-        .await?;
+        });
 
-        let sub_ack = loop {
-            match self.recv().await? {
-                ControlPacket::SubAck(sub_ack)
-                    if sub_ack.packet_identifier == packet_identifier =>
-                {
-                    break sub_ack;
-                }
-                ControlPacket::Publish(publish) => self.try_buffer_publish(publish),
-                ControlPacket::PingResp(_) => {}
-                ControlPacket::Disconnect(disconnect) => {
-                    self.framed_write.get_mut().shutdown().await?;
-                    return Err(Error::Disconnected(disconnect.disconnect_reason_code));
-                }
-                unexpected => {
-                    error!(packet = ?unexpected, "unexpected packet");
-                    self.disconnect(DisconnectReasonCode::PROTOCOL_ERROR)
-                        .await?;
-                    return Err(Error::UnexpectedPacket);
-                }
+        'outer: for _ in 0..=self.connection_settings.max_retries {
+            if let Err(err) = self.send(&packet).await {
+                self.reconnect(err).await?;
+                continue;
             }
-        };
 
-        self.session_state
-            .id_allocator
-            .deallocate(packet_identifier);
+            let sub_ack = loop {
+                let packet = match self.recv().await {
+                    Ok(packet) => packet,
+                    Err(err) => {
+                        self.reconnect(err).await?;
+                        continue 'outer;
+                    }
+                };
+                match packet {
+                    ControlPacket::SubAck(sub_ack)
+                        if sub_ack.packet_identifier == packet_identifier =>
+                    {
+                        break sub_ack;
+                    }
+                    ControlPacket::Publish(publish) => self.try_buffer_publish(publish),
+                    ControlPacket::PingResp(_) => {}
+                    ControlPacket::Disconnect(disconnect) => {
+                        self.connection.framed_write.get_mut().shutdown().await?;
+                        return Err(Error::Disconnected(disconnect.disconnect_reason_code));
+                    }
+                    unexpected => {
+                        error!(packet = ?unexpected, "unexpected packet");
+                        self.disconnect(DisconnectReasonCode::PROTOCOL_ERROR)
+                            .await?;
+                        return Err(Error::UnexpectedPacket);
+                    }
+                }
+            };
 
-        let sub_ack_reason_code = sub_ack.reason_codes[0];
-        if !sub_ack_reason_code.is_success() {
-            return Err(Error::SubscriptionFailed(sub_ack_reason_code));
+            self.session_state
+                .id_allocator
+                .deallocate(packet_identifier);
+
+            let sub_ack_reason_code = sub_ack.reason_codes[0];
+            if !sub_ack_reason_code.is_success() {
+                return Err(Error::SubscriptionFailed(sub_ack_reason_code));
+            }
+
+            return Ok(());
         }
-
-        Ok(())
+        Err(Error::TooManyRetries)
     }
 
     fn try_buffer_publish(&mut self, publish: Publish) {
-        self.buffered_publish_messages.push_back(publish);
+        self.connection.buffered_publish_messages.push_back(publish);
     }
 
     /// This method is cancellation safe.
     pub async fn receive(&mut self) -> Result<(String, Bytes)> {
-        let publish = if let Some(publish) = self.buffered_publish_messages.pop_front() {
+        let publish = if let Some(publish) = self.connection.buffered_publish_messages.pop_front() {
             publish
         } else {
             loop {
-                match self.recv().await? {
+                let packet = match self.recv().await {
+                    Ok(packet) => packet,
+                    Err(err) => {
+                        self.reconnect(err).await?;
+                        continue;
+                    }
+                };
+                match packet {
                     ControlPacket::Publish(publish) => break publish,
                     ControlPacket::PingResp(_) => {}
                     ControlPacket::Disconnect(disconnect) => {
-                        self.framed_write.get_mut().shutdown().await?;
+                        self.connection.framed_write.get_mut().shutdown().await?;
                         return Err(Error::Disconnected(disconnect.disconnect_reason_code));
                     }
                     unexpected => {
@@ -326,7 +400,7 @@ impl<'a> Client<'a> {
 
     async fn disconnect(&mut self, disconnect_reason_code: DisconnectReasonCode) -> Result<()> {
         let res = self
-            .send(ControlPacket::Disconnect(Disconnect {
+            .send(&ControlPacket::Disconnect(Disconnect {
                 disconnect_reason_code,
                 session_expiry_interval: SessionExpiryInterval::default(),
                 reason_string: ReasonString::default(),
@@ -334,14 +408,53 @@ impl<'a> Client<'a> {
                 server_reference: ServerReference::default(),
             }))
             .await;
-        self.framed_write.get_mut().shutdown().await?;
+        self.connection.framed_write.get_mut().shutdown().await?;
         res
+    }
+}
+
+struct Connection {
+    framed_read: FramedRead<OwnedReadHalf, MqttDecoder>,
+    framed_write: FramedWrite<OwnedWriteHalf, MqttEncoder>,
+
+    keep_alive: Option<NonZeroU16>,
+    last_sent: Instant,
+    last_received: Instant,
+    buffered_publish_messages: VecDeque<Publish>,
+}
+
+impl Connection {
+    async fn new(addr: (&str, u16), connection_settings: &ConnectionSettings) -> Result<Self> {
+        let socket = timeout(connection_settings.timeout, TcpStream::connect(addr)).await??;
+        let (read_half, write_half) = socket.into_split();
+        Ok(Self {
+            framed_read: FramedRead::new(
+                read_half,
+                MqttDecoder {
+                    max_packet_length: connection_settings.maximum_packet_size(),
+                    decoder_state: DecoderState::default(),
+                },
+            ),
+            framed_write: FramedWrite::new(
+                write_half,
+                MqttEncoder {
+                    max_packet_length: 1000,
+                },
+            ),
+            keep_alive: connection_settings.keep_alive,
+            last_sent: Instant::now(),
+            last_received: Instant::now(),
+            buffered_publish_messages: VecDeque::new(),
+        })
     }
 }
 
 #[derive(Clone)]
 pub struct ConnectionSettings {
     pub timeout: Duration,
+    pub max_retries: u32,
+    pub max_reconnects: u32,
+    pub reconnect_delay: Duration,
     pub clean_start: bool,
     pub keep_alive: Option<NonZeroU16>,
     pub session_expiry_interval: Option<u32>,
@@ -362,12 +475,64 @@ impl Default for ConnectionSettings {
     fn default() -> Self {
         Self {
             timeout: Duration::from_secs(10),
-            clean_start: true,
+            max_retries: 3,
+            max_reconnects: 3,
+            reconnect_delay: Duration::from_secs(1),
+            clean_start: false,
             keep_alive: NonZeroU16::new(10),
             session_expiry_interval: None,
             user_name: None,
             password: None,
             maximum_packet_size: NonZeroU32::new(0x10000),
+        }
+    }
+}
+
+enum ReconnectState {
+    Connected,
+    Connecting {
+        last_reconnect: Instant,
+        reconnect_counter: u32,
+    },
+}
+
+impl ReconnectState {
+    pub fn new(settings: &ConnectionSettings) -> Self {
+        Self::Connecting {
+            last_reconnect: Instant::now(),
+            reconnect_counter: settings.max_reconnects,
+        }
+    }
+
+    async fn start_reconnect(&mut self, settings: &ConnectionSettings) -> Result<()> {
+        match self {
+            ReconnectState::Connected => *self = Self::new(settings),
+            ReconnectState::Connecting {
+                last_reconnect,
+                reconnect_counter,
+            } => {
+                let deadline = *last_reconnect + settings.reconnect_delay;
+                sleep_until(deadline).await;
+                *reconnect_counter = reconnect_counter
+                    .checked_sub(1)
+                    .ok_or(Error::TooManyReconnects)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn set_connected(&mut self) {
+        *self = Self::Connected;
+    }
+
+    /// Check if a send/receive op can reconnect.
+    ///
+    /// Reconnecting is not allowed when the client is already reconnecting or
+    /// connecting for the first time.
+    fn request_reconnect<E: Into<Error>>(&mut self, err: E) -> Result<E> {
+        match self {
+            ReconnectState::Connected => Ok(err),
+            ReconnectState::Connecting { .. } => Err(err.into()),
         }
     }
 }

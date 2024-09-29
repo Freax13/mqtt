@@ -15,6 +15,10 @@ pub enum Error {
     Encode(#[from] EncodeError),
     #[error("timeout")]
     Timeout,
+    #[error("retried too many times")]
+    TooManyRetries,
+    #[error("reconnected too many times")]
+    TooManyReconnects,
     #[error("unexpected packet")]
     UnexpectedPacket,
     #[error("ran out of packet identifiers")]
